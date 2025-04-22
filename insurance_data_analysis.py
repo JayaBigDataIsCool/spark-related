@@ -8,8 +8,6 @@ spark = SparkSession.builder \
     .appName("Insurance Data Analysis") \
     .getOrCreate()
 
-# Assuming df is already loaded, but if needed:
-# df = spark.table("uc_bi_analytics_disc.rsch_proj_rate_adequacy.stage_0_raw_rtmk_policy")
 
 # Helper function to create nicer tables with descriptions
 def display_with_description(df, description):
