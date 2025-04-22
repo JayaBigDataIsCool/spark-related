@@ -2,7 +2,7 @@
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
 from pyspark.ml.feature import QuantileDiscretizer, Bucketizer
-from typing import List, Dict # For type hinting
+from typing import List, Dict, Tuple # Added Tuple for type hinting
 # import tempfile # No longer needed for base path
 # import shutil # No longer needed for cleanup
 import os # Still used for path joining if needed, but be careful with dbfs:/
@@ -16,10 +16,11 @@ import os # Still used for path joining if needed, but be careful with dbfs:/
 # These widgets will appear at the top of your Databricks notebook.
 # You can set default values here.
 try:
-    dbutils.widgets.text("join_key_column", "user_id", "Join Key Column")
+    # This widget now refers ONLY to the MASTER table's join key
+    dbutils.widgets.text("master_join_key_column", "user_id", "Master Table Join Key Column")
     dbutils.widgets.text("num_buckets", "10", "Number of Buckets")
     # Default to a temporary DBFS path. Change this to your preferred location.
-    dbutils.widgets.text("base_output_path", "dbfs:/tmp/spark_partitioned_delta_dbx", "Base DBFS Output Path")
+    dbutils.widgets.text("base_output_path", "dbfs:/tmp/spark_partitioned_delta_dbx_diffkeys", "Base DBFS Output Path")
     dbutils.widgets.text("partition_key_col", "partition_key", "Partition Key Column Name")
 except:
     print("WARNING: dbutils not found. Running outside Databricks or dbutils is unavailable.")
@@ -28,21 +29,21 @@ except:
 # --- Configuration (Retrieved from Widgets) ---
 # Retrieve values from widgets. If widgets failed, use defaults.
 try:
-    JOIN_KEY_COLUMN = dbutils.widgets.get("join_key_column")
+    MASTER_JOIN_KEY_COLUMN = dbutils.widgets.get("master_join_key_column")
     # Ensure num_buckets is an integer
     NUM_BUCKETS = int(dbutils.widgets.get("num_buckets"))
     BASE_OUTPUT_PATH = dbutils.widgets.get("base_output_path")
     PARTITION_KEY_COL = dbutils.widgets.get("partition_key_col")
 except NameError: # Handle case where dbutils wasn't found
-    JOIN_KEY_COLUMN = "user_id"
+    MASTER_JOIN_KEY_COLUMN = "user_id"
     NUM_BUCKETS = 10
-    BASE_OUTPUT_PATH = "/tmp/spark_partitioned_delta_local" # Fallback for local execution
+    BASE_OUTPUT_PATH = "/tmp/spark_partitioned_delta_local_diffkeys" # Fallback for local execution
     PARTITION_KEY_COL = "partition_key"
-    print(f"Using fallback configuration: JOIN_KEY_COLUMN='{JOIN_KEY_COLUMN}', NUM_BUCKETS={NUM_BUCKETS}, BASE_OUTPUT_PATH='{BASE_OUTPUT_PATH}'")
+    print(f"Using fallback configuration: MASTER_JOIN_KEY_COLUMN='{MASTER_JOIN_KEY_COLUMN}', NUM_BUCKETS={NUM_BUCKETS}, BASE_OUTPUT_PATH='{BASE_OUTPUT_PATH}'")
 
 
 print(f"--- Configuration ---")
-print(f"Join Key Column: {JOIN_KEY_COLUMN}")
+print(f"Master Join Key Column: {MASTER_JOIN_KEY_COLUMN}")
 print(f"Number of Buckets: {NUM_BUCKETS}")
 print(f"Base Output Path: {BASE_OUTPUT_PATH}")
 print(f"Partition Key Column: {PARTITION_KEY_COL}")
@@ -50,131 +51,161 @@ print(f"Partition Key Column: {PARTITION_KEY_COL}")
 
 # --- Sample Data Creation ---
 # (Assuming 'spark' session is available from Databricks)
-# Create sample dataframes to simulate your tables
+# Modify sample data to have DIFFERENT join key column names
 
-# Master Table DataFrame (e.g., user profiles) - potentially larger
+# Master Table DataFrame (e.g., user profiles)
 master_data = [
-    (101, "Alice", 30), (102, "Bob", 25), (103, "Charlie", 35),
-    (104, "David", 22), (105, "Eve", 28), (106, "Frank", 40),
-    (107, "Grace", 31), (108, "Heidi", 29), (109, "Ivan", 27),
-    (110, "Judy", 33), (111, "Mallory", 45), (112, "Niaj", 20),
+    (101, "Alice", 30), (102, "Bob", 25), (103, "Charlie", 35), (104, "David", 22),
+    (105, "Eve", 28), (106, "Frank", 40), (107, "Grace", 31), (108, "Heidi", 29),
+    (109, "Ivan", 27), (110, "Judy", 33), (111, "Mallory", 45), (112, "Niaj", 20),
     (113, "Olivia", 38), (114, "Peggy", 26), (115, "Quentin", 32)
-] * 10 # Multiply to make it a bit larger for discretization
-master_df_obj = spark.createDataFrame(master_data, [JOIN_KEY_COLUMN, "name", "age"])
+] * 10
+# Use the configured master join key name here
+master_df_obj = spark.createDataFrame(master_data, [MASTER_JOIN_KEY_COLUMN, "name", "age"])
 
-# Detail Table 1 DataFrame (e.g., user orders)
+# Detail Table 1 DataFrame (e.g., user orders) - Use a DIFFERENT join key name: 'uid'
+DETAIL1_JOIN_KEY_COLUMN = "uid" # Define the specific key name for this table
 detail1_data = [
-    (101, "order1", 50.0), (103, "order2", 25.5), (101, "order3", 10.0),
-    (105, "order4", 100.0), (107, "order5", 75.2), (109, "order6", 15.0),
-    (102, "order7", 30.0), (111, "order8", 200.0), (115, "order9", 45.0),
-    (104, "order10", 60.0), (113, "order11", 90.0)
+    (101, "order1", 50.0), (103, "order2", 25.5), (101, "order3", 10.0), (105, "order4", 100.0),
+    (107, "order5", 75.2), (109, "order6", 15.0), (102, "order7", 30.0), (111, "order8", 200.0),
+    (115, "order9", 45.0), (104, "order10", 60.0), (113, "order11", 90.0)
 ]
-detail1_df_obj = spark.createDataFrame(detail1_data, [JOIN_KEY_COLUMN, "order_id", "amount"])
+detail1_df_obj = spark.createDataFrame(detail1_data, [DETAIL1_JOIN_KEY_COLUMN, "order_id", "amount"])
 
-# Detail Table 2 DataFrame (e.g., user activity)
+# Detail Table 2 DataFrame (e.g., user activity) - Use the SAME name as master for this example: 'user_id'
+DETAIL2_JOIN_KEY_COLUMN = MASTER_JOIN_KEY_COLUMN # Or could be different, e.g., "account_id"
 detail2_data = [
-    (102, "login", "2023-10-26"), (104, "click", "2023-10-26"),
-    (101, "view", "2023-10-27"), (105, "login", "2023-10-27"),
-    (108, "logout", "2023-10-28"), (110, "view", "2023-10-28"),
-    (112, "click", "2023-10-29"), (114, "login", "2023-10-29"),
-    (106, "view", "2023-10-30"), (113, "click", "2023-10-30")
+    (102, "login", "2023-10-26"), (104, "click", "2023-10-26"), (101, "view", "2023-10-27"),
+    (105, "login", "2023-10-27"), (108, "logout", "2023-10-28"), (110, "view", "2023-10-28"),
+    (112, "click", "2023-10-29"), (114, "login", "2023-10-29"), (106, "view", "2023-10-30"),
+    (113, "click", "2023-10-30")
 ]
-detail2_df_obj = spark.createDataFrame(detail2_data, [JOIN_KEY_COLUMN, "activity", "timestamp"])
+detail2_df_obj = spark.createDataFrame(detail2_data, [DETAIL2_JOIN_KEY_COLUMN, "activity", "timestamp"])
 
-print("\n--- Sample DataFrames Created (Objects) ---")
+print("\n--- Sample DataFrames Created (Objects with Potentially Different Key Names) ---")
+print("Master DF Schema:")
+master_df_obj.printSchema()
 master_df_obj.show(5)
+print("\nDetail DF 1 Schema:")
+detail1_df_obj.printSchema()
 detail1_df_obj.show(5)
+print("\nDetail DF 2 Schema:")
+detail2_df_obj.printSchema()
 detail2_df_obj.show(5)
 
 
-# --- Reusable Partitioning Function (DataFrame Input) ---
-# This function remains largely the same, but relies on the calling environment
-# for 'spark' and passes parameters like partition_key_col.
+# --- Reusable Partitioning Function (DataFrame Input, Different Join Keys) ---
 
 def create_partitioned_tables_from_dfs(
-    spark: SparkSession, # Pass spark session explicitly
+    spark: SparkSession,
     master_df: DataFrame,
-    detail_dfs: List[DataFrame],
-    join_key_col: str,
+    master_join_key_col: str, # Join key name for master_df
+    detail_dfs_with_keys: List[Tuple[DataFrame, str]], # List of (detail_df, detail_join_key_name)
     num_buckets: int,
     output_base_path: str,
-    partition_key_col: str # Now passed as argument
+    partition_key_col: str
 ) -> Dict[str, str]:
     """
     Analyzes join key distribution on master_df, creates consistent buckets,
-    and writes partitioned master and detail DataFrames to Delta format.
-    Optimized for Databricks (expects DBFS paths, uses provided spark session).
+    and writes partitioned master and detail DataFrames to Delta format,
+    handling potentially different join key column names across tables.
 
     Args:
         spark: The SparkSession (Delta enabled).
         master_df: The master DataFrame object for discretization.
-        detail_dfs: A list of detail DataFrame objects to partition.
-        join_key_col: The name of the column used for joining.
+        master_join_key_col: The name of the join key column in master_df.
+        detail_dfs_with_keys: A list of tuples, where each tuple contains a
+                               detail DataFrame and the name of its join key column,
+                               e.g., [(df1, "key1"), (df2, "key2")].
         num_buckets: The desired number of partitions/buckets.
-        output_base_path: The base directory to write partitioned Delta tables (e.g., DBFS path).
+        output_base_path: The base directory to write partitioned Delta tables.
         partition_key_col: The name for the new partition key column.
 
     Returns:
-        A dictionary mapping generic table identifiers ('master', 'detail_0',
-        'detail_1', etc.) to their corresponding output Delta table paths.
+        A dictionary mapping generic table identifiers ('master', 'detail_0', ...)
+        to their corresponding output Delta table paths.
     """
-    print(f"\n--- Starting Partitioning Process from DataFrames for Key: '{join_key_col}' ---")
+    print(f"\n--- Starting Partitioning Process (Handling Different Join Keys) ---")
+    print(f"Master Join Key: '{master_join_key_col}'")
 
     # 1. Analyze Key Distribution on Master DataFrame
-    print(f"1. Analyzing key distribution on master DataFrame...")
-    if join_key_col not in master_df.columns:
-         raise ValueError(f"Join key column '{join_key_col}' not found in master DataFrame.")
-    if dict(master_df.dtypes)[join_key_col] not in ('int', 'bigint', 'double', 'float', 'long'):
-         raise TypeError(f"Join key column '{join_key_col}' must be numeric for QuantileDiscretizer. Found type: {dict(master_df.dtypes)[join_key_col]}")
+    print(f"1. Analyzing key distribution on master DataFrame using '{master_join_key_col}'...")
+    if master_join_key_col not in master_df.columns:
+         raise ValueError(f"Master join key column '{master_join_key_col}' not found in master DataFrame.")
+    if dict(master_df.dtypes)[master_join_key_col] not in ('int', 'bigint', 'double', 'float', 'long'):
+         raise TypeError(f"Master join key column '{master_join_key_col}' must be numeric. Found type: {dict(master_df.dtypes)[master_join_key_col]}")
 
     qds = QuantileDiscretizer(
         numBuckets=num_buckets,
-        inputCol=join_key_col,
+        inputCol=master_join_key_col, # Use master key here
         outputCol="temp_bucket_qds",
         relativeError=0.001,
         handleInvalid="error"
     )
-    qds_model = qds.fit(master_df.select(join_key_col))
+    qds_model = qds.fit(master_df.select(master_join_key_col))
 
-    # 2. Get Splits for Bucketizer
+    # 2. Get Splits for Bucketizer (These splits are universal)
     splits = [-float("inf")] + qds_model.getSplits()[1:-1] + [float("inf")]
-    print(f"2. Calculated {len(splits)-1} split points for {num_buckets} buckets: {splits}")
+    print(f"2. Calculated {len(splits)-1} universal split points: {splits}")
 
-    # 3. Create Bucketizer
-    print(f"3. Creating Bucketizer with these splits...")
-    bucketizer = Bucketizer(
+    # --- Process Master Table ---
+    print(f"3. Processing Master Table...")
+    master_bucketizer = Bucketizer(
         splits=splits,
-        inputCol=join_key_col,
-        outputCol=partition_key_col, # Use the parameter
+        inputCol=master_join_key_col, # Use master key name
+        outputCol=partition_key_col,
         handleInvalid="error"
     )
+    master_df_bucketed = master_bucketizer.transform(master_df)
+    master_df_partitioned = master_df_bucketed.withColumn(
+        partition_key_col,
+        F.col(partition_key_col).cast("int")
+    )
 
-    # Combine master and detail dfs for processing
-    all_dfs_to_process = {'master': master_df}
-    for i, df in enumerate(detail_dfs):
-        if join_key_col not in df.columns:
-            print(f"WARNING: Join key column '{join_key_col}' not found in detail DataFrame at index {i}. Skipping.")
+    partitioned_dfs = {'master': master_df_partitioned}
+    output_paths = {'master': f"{output_base_path}/master_partitioned_delta"}
+
+    print(f"     Schema for 'master' after adding partition key:")
+    master_df_partitioned.printSchema()
+    master_df_partitioned.select(master_join_key_col, partition_key_col).show(5, truncate=False)
+
+
+    # --- Process Detail Tables ---
+    print(f"\n4. Processing Detail Tables...")
+    for i, (detail_df, detail_join_key_col) in enumerate(detail_dfs_with_keys):
+        identifier = f'detail_{i}'
+        print(f"   - Processing DataFrame: '{identifier}' using its join key '{detail_join_key_col}'")
+
+        # Validate join key exists in this detail DataFrame
+        if detail_join_key_col not in detail_df.columns:
+            print(f"   WARNING: Join key column '{detail_join_key_col}' not found in detail DataFrame '{identifier}'. Skipping.")
             continue
-        all_dfs_to_process[f'detail_{i}'] = df
+        # Optional: Add numeric type check for detail key if needed, though bucketizer might handle some types implicitly
+        # if dict(detail_df.dtypes)[detail_join_key_col] not in ('int', 'bigint', 'double', 'float', 'long'):
+        #    print(f"   WARNING: Join key column '{detail_join_key_col}' in detail DataFrame '{identifier}' is not numeric. Bucketizer might fail.")
 
-    partitioned_dfs = {}
-    output_paths = {}
 
-    # 4. Apply Bucketizer and Prepare for Writing
-    print(f"4. Applying Bucketizer to all DataFrames...")
-    for identifier, df in all_dfs_to_process.items():
-        print(f"   - Processing DataFrame: '{identifier}'")
-        df_bucketed = bucketizer.transform(df)
+        # Create a specific Bucketizer instance for this DF using the universal splits
+        detail_bucketizer = Bucketizer(
+            splits=splits, # Use the SAME splits calculated from master
+            inputCol=detail_join_key_col, # Use the SPECIFIC key name for this detail DF
+            outputCol=partition_key_col,
+            handleInvalid="error"
+        )
+
+        df_bucketed = detail_bucketizer.transform(detail_df)
         df_partitioned = df_bucketed.withColumn(
             partition_key_col,
             F.col(partition_key_col).cast("int")
         )
+
         partitioned_dfs[identifier] = df_partitioned
-        # Construct the output path (using simple string concatenation for DBFS)
         output_paths[identifier] = f"{output_base_path}/{identifier}_partitioned_delta"
         print(f"     Schema for '{identifier}' after adding partition key:")
         df_partitioned.printSchema()
-        df_partitioned.select(join_key_col, partition_key_col).show(5, truncate=False)
+        # Show the specific join key used for this table alongside the partition key
+        df_partitioned.select(detail_join_key_col, partition_key_col).show(5, truncate=False)
+
 
     # 5. Write Partitioned Tables in Delta Format
     print(f"\n5. Writing partitioned Delta tables to subdirectories in: '{output_base_path}'")
@@ -182,18 +213,15 @@ def create_partitioned_tables_from_dfs(
         output_path = output_paths[identifier]
         print(f"   - Writing '{identifier}' partitioned by '{partition_key_col}' to Delta path: {output_path}")
         try:
-            # Ensure the target directory is clean before writing (important for overwrite)
+            # Ensure the target directory is clean before writing
             try:
                 dbutils.fs.rm(output_path, recurse=True)
                 print(f"     Cleaned existing path: {output_path}")
             except Exception as e:
-                 # Handle cases where the path doesn't exist yet or other FS errors during cleanup
-                 # Check if error message indicates path not found, which is okay
                  if "java.io.FileNotFoundException" not in str(e) and "Path does not exist" not in str(e):
                       print(f"     Warning during pre-write cleanup of {output_path}: {e}")
                  else:
                       print(f"     Path {output_path} does not exist yet, proceeding with write.")
-
 
             df_to_write.write \
                 .partitionBy(partition_key_col) \
@@ -208,19 +236,25 @@ def create_partitioned_tables_from_dfs(
     print("\n--- Partitioning Process Complete ---")
     return output_paths
 
-# --- Execute the Partitioning with DataFrame Objects ---
-# Pass parameters retrieved from widgets (or defaults)
+# --- Execute the Partitioning with DataFrame Objects and Specific Keys ---
+# Define the list of detail dataframes with their respective join key column names
+detail_dfs_info = [
+    (detail1_df_obj, DETAIL1_JOIN_KEY_COLUMN), # Using 'uid' for this one
+    (detail2_df_obj, DETAIL2_JOIN_KEY_COLUMN)  # Using 'user_id' for this one
+]
+
 delta_table_paths = create_partitioned_tables_from_dfs(
-    spark=spark, # Use the Databricks spark session
+    spark=spark,
     master_df=master_df_obj,
-    detail_dfs=[detail1_df_obj, detail2_df_obj],
-    join_key_col=JOIN_KEY_COLUMN,
+    master_join_key_col=MASTER_JOIN_KEY_COLUMN, # Pass master key name
+    detail_dfs_with_keys=detail_dfs_info, # Pass list of (df, key_name) tuples
     num_buckets=NUM_BUCKETS,
     output_base_path=BASE_OUTPUT_PATH,
-    partition_key_col=PARTITION_KEY_COL # Pass partition key name
+    partition_key_col=PARTITION_KEY_COL
 )
 
 # --- Example: Reading and Joining Partitioned Delta Data ---
+# NOTE: When joining, you still need to alias the columns if they have different names!
 print("\n--- Example: Reading and Joining Partitioned Delta Data ---")
 
 master_key = 'master'
@@ -230,7 +264,6 @@ if master_key in delta_table_paths and detail1_key in delta_table_paths:
     master_partitioned_path = delta_table_paths[master_key]
     detail1_partitioned_path = delta_table_paths[detail1_key]
 
-    # Check if paths actually exist before reading (optional but good practice)
     paths_exist = False
     try:
         dbutils.fs.ls(master_partitioned_path)
@@ -246,55 +279,43 @@ if master_key in delta_table_paths and detail1_key in delta_table_paths:
         print(f"\nReading Delta table '{detail1_key}' from: {detail1_partitioned_path}")
         df_detail1_read = spark.read.format("delta").load(detail1_partitioned_path)
 
-        print(f"\nSchema of read master Delta table:")
-        df_master_read.printSchema()
-        print(f"\nSchema of read detail 1 Delta table:")
-        df_detail1_read.printSchema()
-
-        print("\nPerforming join on partitioned Delta tables...")
-        joined_df = df_master_read.join(
-            df_detail1_read,
-            on=JOIN_KEY_COLUMN,
+        print("\nPerforming join on partitioned Delta tables (requires aliasing join keys)...")
+        # IMPORTANT: Alias the join columns to match during the join operation
+        joined_df = df_master_read.alias("m").join(
+            df_detail1_read.alias("d1"),
+            F.col(f"m.{MASTER_JOIN_KEY_COLUMN}") == F.col(f"d1.{DETAIL1_JOIN_KEY_COLUMN}"), # Use correct names!
             how="inner"
-        )
+        ).select("m.*", "d1.order_id", "d1.amount") # Select desired columns
+
         print("Showing joined results (first 10 rows):")
         joined_df.show(10)
         print("\nExplain plan for the join:")
         joined_df.explain()
     else:
          print("Skipping read/join as output paths were not confirmed to exist.")
-
 else:
-    print(f"Skipping read/join example because expected table paths ('{master_key}', '{detail1_key}') were not found in the returned dictionary: {delta_table_paths}")
+    print(f"Skipping read/join example because expected table paths ('{master_key}', '{detail1_key}') were not found: {delta_table_paths}")
 
 
 # --- Cleanup Temporary Directory using dbutils ---
-# Optional: You might want to keep the output tables.
-# Add a widget to control cleanup?
-# dbutils.widgets.dropdown("cleanup_output", "False", ["True", "False"], "Cleanup Output?")
-# perform_cleanup = dbutils.widgets.get("cleanup_output") == "True"
+perform_cleanup = True # Set default cleanup behavior
 
-perform_cleanup = True # Hardcoded to True for this example run
+# Optional: Add a widget to control cleanup
+# try:
+#     dbutils.widgets.dropdown("cleanup_output", "True", ["True", "False"], "Cleanup Output?")
+#     perform_cleanup = dbutils.widgets.get("cleanup_output") == "True"
+# except:
+#     print("Cleanup widget not available.")
+
 
 if perform_cleanup:
     print(f"\nCleaning up output directory: {BASE_OUTPUT_PATH}")
     try:
-        # Use dbutils.fs.rm for DBFS paths
         dbutils.fs.rm(BASE_OUTPUT_PATH, recurse=True)
         print("Cleanup successful using dbutils.")
     except Exception as e:
-        # Catch potential errors if dbutils is not available or path doesn't exist
         print(f"Error during dbutils cleanup {BASE_OUTPUT_PATH}: {e}")
-        # Fallback attempt for local paths if dbutils failed (less likely in Databricks)
-        # import shutil
-        # if os.path.exists(BASE_OUTPUT_PATH) and not BASE_OUTPUT_PATH.startswith("dbfs:/"):
-        #     try:
-        #         shutil.rmtree(BASE_OUTPUT_PATH)
-        #         print("Cleanup successful using shutil (local path).")
-        #     except OSError as sh_e:
-        #         print(f"Error removing directory using shutil {BASE_OUTPUT_PATH}: {sh_e}")
 else:
     print(f"\nSkipping cleanup for: {BASE_OUTPUT_PATH}")
 
-
-# spark.stop() # Definitely do not stop the SparkSession in Databricks notebooks
+# spark.stop()
